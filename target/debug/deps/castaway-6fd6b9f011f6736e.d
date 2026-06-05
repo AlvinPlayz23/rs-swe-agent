@@ -1,0 +1,10 @@
+/teamspace/studios/this_studio/mini-swe-agent-rs/target/debug/deps/castaway-6fd6b9f011f6736e.d: /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/lib.rs /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/internal.rs /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/lifetime_free.rs /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/utils.rs
+
+/teamspace/studios/this_studio/mini-swe-agent-rs/target/debug/deps/libcastaway-6fd6b9f011f6736e.rlib: /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/lib.rs /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/internal.rs /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/lifetime_free.rs /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/utils.rs
+
+/teamspace/studios/this_studio/mini-swe-agent-rs/target/debug/deps/libcastaway-6fd6b9f011f6736e.rmeta: /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/lib.rs /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/internal.rs /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/lifetime_free.rs /teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/utils.rs
+
+/teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/lib.rs:
+/teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/internal.rs:
+/teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/lifetime_free.rs:
+/teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/castaway-0.2.4/src/utils.rs:
