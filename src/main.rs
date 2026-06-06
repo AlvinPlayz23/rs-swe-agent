@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod environment;
+mod markdown;
 mod model;
 mod prompts;
 mod tui;
@@ -62,12 +63,15 @@ fn config_set(key: &str, value: &str) -> Result<()> {
 
 async fn run_print_chat(input: String) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiMsg>();
+    // No streaming for print mode (simpler)
     tokio::spawn(async move {
-        if let Err(e) = agent::run_chat(input, Vec::<ChatMessage>::new(), tx.clone()).await {
+        if let Err(e) = agent::run_chat(input, Vec::<ChatMessage>::new(), tx.clone(), None).await {
             tx.send(UiMsg::Log(Item {
                 title: "error".into(),
                 body: format!("{e:#}"),
                 color: Color::Red,
+                is_markdown: false,
+                is_truncatable: false,
             }))
             .ok();
             tx.send(UiMsg::Done).ok();
@@ -79,11 +83,13 @@ async fn run_print_chat(input: String) -> Result<()> {
 async fn run_print_build(input: String) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiMsg>();
     tokio::spawn(async move {
-        if let Err(e) = agent::run_agent(input, tx.clone()).await {
+        if let Err(e) = agent::run_agent(input, tx.clone(), None).await {
             tx.send(UiMsg::Log(Item {
                 title: "error".into(),
                 body: format!("{e:#}"),
                 color: Color::Red,
+                is_markdown: false,
+                is_truncatable: false,
             }))
             .ok();
             tx.send(UiMsg::Done).ok();

@@ -9,6 +9,15 @@ pub enum UiMsg {
     Done,
 }
 
+#[derive(Clone, Debug)]
+pub struct Item {
+    pub title: String,
+    pub body: String,
+    pub color: Color,
+    pub is_markdown: bool,
+    pub is_truncatable: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Chat,
@@ -16,26 +25,19 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub const fn toggle(self) -> Self {
+    pub fn toggle(self) -> Self {
         match self {
             Self::Chat => Self::Build,
             Self::Build => Self::Chat,
         }
     }
 
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Chat => "CHAT",
             Self::Build => "BUILD",
         }
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct Item {
-    pub title: String,
-    pub body: String,
-    pub color: Color,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

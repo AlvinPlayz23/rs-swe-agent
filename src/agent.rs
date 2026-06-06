@@ -9,16 +9,71 @@ use ratatui::style::Color;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+fn content_string(msg: &ChatMessage) -> String {
+    match &msg.content {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+        None => String::new(),
+    }
+}
+
+fn observation(out: &CommandOutput) -> String {
+    if out.output.len() <= 10_000 {
+        json!({"returncode": out.returncode, "output": out.output, "exception_info": out.exception_info})
+            .to_string()
+    } else {
+        let head: String = out.output.chars().take(5000).collect();
+        let tail: String = out
+            .output
+            .chars()
+            .rev()
+            .take(5000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        json!({"returncode": out.returncode, "output_head": head, "output_tail": tail, "warning": "Output too long.", "exception_info": out.exception_info})
+            .to_string()
+    }
+}
+
+async fn build_model_and_env() -> Result<(Model, LocalEnvironment)> {
+    let model = Model::from_env()?;
+    let env = LocalEnvironment::new()?;
+    Ok((model, env))
+}
+
+fn build_system_user(system_prompt: &str, user_content: String) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some(Value::String(system_prompt.into())),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some(Value::String(user_content)),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+    ]
+}
+
 pub async fn run_chat(
     input: String,
     mut messages: Vec<ChatMessage>,
     tx: mpsc::UnboundedSender<UiMsg>,
+    stream_tx: Option<mpsc::UnboundedSender<String>>,
 ) -> Result<()> {
     let model = Model::from_env()?;
+
     tx.send(UiMsg::Log(Item {
         title: "user".into(),
         body: input.clone(),
         color: Color::Cyan,
+        is_markdown: false,
+        is_truncatable: false,
     }))
     .ok();
 
@@ -37,89 +92,60 @@ pub async fn run_chat(
         tool_calls: None,
     });
 
-    tx.send(UiMsg::Log(Item {
-        title: "chat model call".into(),
-        body: "waiting...".into(),
-        color: Color::DarkGray,
-    }))
-    .ok();
-    let assistant = model.query_chat(&messages).await?;
+    let assistant = if let Some(stx) = stream_tx {
+        model.query_chat_stream(&messages, stx).await?
+    } else {
+        model.query_chat(&messages).await?
+    };
+
     let text = content_string(&assistant);
-    tx.send(UiMsg::Log(Item {
-        title: "assistant".into(),
-        body: text,
-        color: Color::Green,
-    }))
-    .ok();
+    if !text.trim().is_empty() {
+        tx.send(UiMsg::Log(Item {
+            title: "assistant".into(),
+            body: text,
+            color: Color::Green,
+            is_markdown: true,
+            is_truncatable: false,
+        }))
+        .ok();
+    }
     messages.push(assistant);
     tx.send(UiMsg::ChatDone(messages)).ok();
     Ok(())
 }
 
-fn content_string(msg: &ChatMessage) -> String {
-    match &msg.content {
-        Some(Value::String(s)) => s.clone(),
-        Some(v) => v.to_string(),
-        None => String::new(),
-    }
-}
+pub async fn run_agent(
+    task: String,
+    tx: mpsc::UnboundedSender<UiMsg>,
+    stream_tx: Option<mpsc::UnboundedSender<String>>,
+) -> Result<()> {
+    let (model, env) = build_model_and_env().await?;
+    let mut messages = build_system_user(BUILD_SYSTEM_PROMPT, render_build_prompt(&task));
 
-fn observation(out: &CommandOutput) -> String {
-    if out.output.len() <= 10_000 {
-        json!({"returncode": out.returncode, "output": out.output, "exception_info": out.exception_info}).to_string()
-    } else {
-        let head: String = out.output.chars().take(5000).collect();
-        let tail: String = out
-            .output
-            .chars()
-            .rev()
-            .take(5000)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        json!({"returncode": out.returncode, "output_head": head, "output_tail": tail, "warning": "Output too long.", "exception_info": out.exception_info}).to_string()
-    }
-}
-
-pub async fn run_agent(task: String, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()> {
-    let model = Model::from_env()?;
-    let env = LocalEnvironment::new()?;
-    let mut messages = vec![
-        ChatMessage {
-            role: "system".into(),
-            content: Some(Value::String(BUILD_SYSTEM_PROMPT.into())),
-            tool_call_id: None,
-            tool_calls: None,
-        },
-        ChatMessage {
-            role: "user".into(),
-            content: Some(Value::String(render_build_prompt(&task))),
-            tool_call_id: None,
-            tool_calls: None,
-        },
-    ];
     tx.send(UiMsg::Log(Item {
         title: "user".into(),
         body: task,
         color: Color::Cyan,
+        is_markdown: false,
+        is_truncatable: false,
     }))
     .ok();
 
-    for step in 1..=100 {
-        tx.send(UiMsg::Log(Item {
-            title: format!("model call {step}"),
-            body: "waiting...".into(),
-            color: Color::DarkGray,
-        }))
-        .ok();
-        let assistant = model.query_build(&messages).await?;
+    for _step in 1..=100 {
+        let assistant = if let Some(stx) = stream_tx.clone() {
+            model.query_build_stream(&messages, stx).await?
+        } else {
+            model.query_build(&messages).await?
+        };
+
         let text = content_string(&assistant);
         if !text.trim().is_empty() {
             tx.send(UiMsg::Log(Item {
                 title: "assistant".into(),
                 body: text,
                 color: Color::Green,
+                is_markdown: true,
+                is_truncatable: false,
             }))
             .ok();
         }
@@ -140,6 +166,8 @@ pub async fn run_agent(task: String, tx: mpsc::UnboundedSender<UiMsg>) -> Result
                 title: "tool: bash".into(),
                 body: cmd.to_string(),
                 color: Color::Yellow,
+                is_markdown: false,
+                is_truncatable: false,
             }))
             .ok();
             let out = env.execute(cmd).await;
@@ -152,6 +180,8 @@ pub async fn run_agent(task: String, tx: mpsc::UnboundedSender<UiMsg>) -> Result
                 } else {
                     Color::LightRed
                 },
+                is_markdown: false,
+                is_truncatable: true,
             }))
             .ok();
             if out.returncode == 0
@@ -162,6 +192,8 @@ pub async fn run_agent(task: String, tx: mpsc::UnboundedSender<UiMsg>) -> Result
                     title: "exit: Submitted".into(),
                     body: out.output.lines().skip(1).collect::<Vec<_>>().join("\n"),
                     color: Color::Magenta,
+                    is_markdown: false,
+                    is_truncatable: false,
                 }))
                 .ok();
                 tx.send(UiMsg::Done).ok();
