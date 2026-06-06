@@ -10,10 +10,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::Paragraph,
     Terminal,
 };
 use std::{io, time::Duration};
@@ -25,6 +25,8 @@ struct App {
     running: bool,
     mode: Mode,
     chat_messages: Vec<ChatMessage>,
+    scroll: usize,
+    auto_scroll: bool,
 }
 
 pub async fn run() -> Result<()> {
@@ -46,10 +48,13 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
         running: false,
         mode: Mode::Chat,
         chat_messages: Vec::new(),
+        scroll: 0,
+        auto_scroll: true,
     };
 
     loop {
         while let Ok(msg) = rx.try_recv() {
+            let had_new = matches!(&msg, UiMsg::Log(_));
             match msg {
                 UiMsg::Log(item) => app.items.push(item),
                 UiMsg::ChatDone(messages) => {
@@ -58,9 +63,12 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
                 }
                 UiMsg::Done => app.running = false,
             }
+            if had_new && app.auto_scroll {
+                app.scroll = 0;
+            }
         }
 
-        terminal.draw(|f| draw(f, &app))?;
+        terminal.draw(|f| draw(f, &mut app))?;
 
         if event::poll(Duration::from_millis(80))? {
             if let Event::Key(KeyEvent {
@@ -76,10 +84,14 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
                             body: format!("MODE: {}. {}", app.mode.label(), mode_note(app.mode)),
                             color: mode_color(app.mode),
                         });
+                        app.auto_scroll = true;
+                        app.scroll = 0;
                     }
                     (KeyCode::Enter, _) if !app.running && !app.input.trim().is_empty() => {
                         let input = std::mem::take(&mut app.input);
                         app.running = true;
+                        app.auto_scroll = true;
+                        app.scroll = 0;
                         let tx2 = tx.clone();
                         match app.mode {
                             Mode::Chat => {
@@ -109,6 +121,16 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
                                     }
                                 });
                             }
+                        }
+                    }
+                    (KeyCode::Up, _) | (KeyCode::PageUp, _) if !app.running => {
+                        app.auto_scroll = false;
+                        app.scroll = app.scroll.saturating_add(3);
+                    }
+                    (KeyCode::Down, _) | (KeyCode::PageDown, _) if !app.running => {
+                        app.scroll = app.scroll.saturating_sub(1);
+                        if app.scroll == 0 {
+                            app.auto_scroll = true;
                         }
                     }
                     (KeyCode::Backspace, _) if !app.running => {
@@ -152,40 +174,11 @@ const fn mode_note(mode: Mode) -> &'static str {
     }
 }
 
-fn draw(f: &mut ratatui::Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(3),
-        ])
-        .split(f.size());
-
-    let status = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!(" MODE: {} ", app.mode.label()),
-            Style::default()
-                .fg(Color::Black)
-                .bg(mode_color(app.mode))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  Tab: switch mode  |  Enter: send  |  Esc/Ctrl-C: quit  "),
-        Span::styled(
-            mode_note(app.mode),
-            Style::default()
-                .fg(Color::LightRed)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]))
-    .block(Block::default().borders(Borders::ALL).title("mode"));
-    f.render_widget(status, chunks[0]);
-
+fn render_lines<'a>(items: &'a [Item], width: usize) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
-    let width = chunks[1].width.saturating_sub(4) as usize;
-    for item in &app.items {
+    for item in items {
         lines.push(Line::from(vec![Span::styled(
-            item.title.clone(),
+            format!("{}", item.title),
             Style::default().fg(item.color).add_modifier(Modifier::BOLD),
         )]));
         for l in textwrap::wrap(&item.body, width.max(20)) {
@@ -193,20 +186,95 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         }
         lines.push(Line::from(""));
     }
+    lines
+}
 
-    let visible = chunks[1].height.saturating_sub(2) as usize;
-    let start = lines.len().saturating_sub(visible);
-    let log = Paragraph::new(lines[start..].to_vec())
-        .block(Block::default().borders(Borders::ALL).title("conversation"))
-        .wrap(Wrap { trim: false });
-    f.render_widget(log, chunks[1]);
+fn draw(f: &mut ratatui::Frame, app: &mut App) {
+    let area = f.size();
+    if area.height < 4 || area.width < 4 {
+        return;
+    }
 
-    let prompt_title = if app.running {
-        format!("{} running...", app.mode.label())
+    // layout: status (1 line), gap (1), transcript (remaining - 2), prompt (1)
+    let prompt_area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+    let status_area = Rect::new(area.x, area.y, area.width, 1);
+    let gap_area = Rect::new(area.x, area.y + 1, area.width, 1);
+    let transcript_area = Rect::new(
+        area.x,
+        area.y + 2,
+        area.width,
+        area.height.saturating_sub(3),
+    );
+
+    // status line
+    let status = Line::from(vec![
+        Span::styled(
+            format!(" {} ", app.mode.label()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(mode_color(app.mode))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" Tab:switch  "),
+        Span::styled(
+            mode_note(app.mode),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(status), status_area);
+
+    // gap
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        gap_area,
+    );
+
+    // transcript
+    let transcript_width = transcript_area.width as usize;
+    let all_lines = render_lines(&app.items, transcript_width);
+    let total_lines = all_lines.len();
+
+    // clamp scroll
+    let visible_lines = transcript_area.height as usize;
+    if app.scroll >= total_lines.saturating_sub(visible_lines) {
+        if total_lines > visible_lines {
+            app.scroll = total_lines - visible_lines;
+        } else {
+            app.scroll = 0;
+            app.auto_scroll = true;
+        }
+    }
+
+    let start = total_lines.saturating_sub(visible_lines + app.scroll);
+    let end = start + visible_lines.min(total_lines - start);
+    let visible: Vec<Line> = if start < total_lines {
+        all_lines[start..end].to_vec()
     } else {
-        format!("{} prompt", app.mode.label())
+        Vec::new()
     };
-    let prompt = Paragraph::new(app.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title(prompt_title));
-    f.render_widget(prompt, chunks[2]);
+
+    f.render_widget(Paragraph::new(visible), transcript_area);
+
+    // prompt
+    let prompt_prefix = if app.running {
+        Span::styled("...", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::styled("> ", Style::default().fg(mode_color(app.mode)))
+    };
+    let prompt_line = Line::from(vec![prompt_prefix, Span::raw(&app.input)]);
+    f.render_widget(Paragraph::new(prompt_line), prompt_area);
+
+    // cursor
+    let cursor_x = if app.running {
+        0
+    } else {
+        2 + app.input.len() as u16
+    };
+    let cursor_y = prompt_area.y;
+    f.set_cursor(area.x + cursor_x, cursor_y);
 }
