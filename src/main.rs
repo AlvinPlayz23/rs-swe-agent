@@ -4,12 +4,14 @@ mod environment;
 mod markdown;
 mod model;
 mod prompts;
+mod session;
 mod tui;
 mod types;
 
 use anyhow::{anyhow, Result};
 use config::{config_path, Config};
 use ratatui::style::Color;
+use session::{format_sessions, latest_session, list_sessions, resolve_session_id};
 use tokio::sync::mpsc;
 use types::{ChatMessage, Item, UiMsg};
 
@@ -18,6 +20,23 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => tui::run().await,
+        [flag, id] if flag == "--resume" => tui::run_with_session(Some(id.clone())).await,
+        [flag] if flag == "--latest" => {
+            let Some(summary) = latest_session()? else {
+                println!("No saved sessions.");
+                return Ok(());
+            };
+            tui::run_with_session(Some(summary.id)).await
+        }
+        [flag] if flag == "--sessions" => {
+            println!("{}", format_sessions(&list_sessions()?));
+            Ok(())
+        }
+        [flag, id] if flag == "--session-path" => {
+            let full = resolve_session_id(id)?;
+            println!("{}", session::session_path(&full)?.display());
+            Ok(())
+        }
         [flag, rest @ ..] if flag == "--chat" || flag == "--ask" => {
             run_print_chat(join_args(rest)?).await
         }
@@ -113,6 +132,6 @@ async fn print_events(rx: &mut mpsc::UnboundedReceiver<UiMsg>) -> Result<()> {
 fn print_help() {
     eprintln!(
         "mini-swe-agent-rs\n\n\
-Usage:\n  mini-swe-agent-rs                         Start TUI\n  mini-swe-agent-rs --chat <message>        One-shot non-interactive chat/ask mode\n  mini-swe-agent-rs --build <task>          One-shot non-interactive build/task mode\n  mini-swe-agent-rs --config-set api_key <key>\n  mini-swe-agent-rs --config-set base_url <url>\n  mini-swe-agent-rs --config-set model <model>\n  mini-swe-agent-rs --config-show\n  mini-swe-agent-rs --config-path\n\nEnv vars still override config: OPENAI_API_KEY, OPENAI_BASE_URL, MINI_SWE_MODEL\n"
+Usage:\n  mini-swe-agent-rs                         Start TUI\n  mini-swe-agent-rs --chat <message>        One-shot non-interactive chat/ask mode\n  mini-swe-agent-rs --build <task>          One-shot non-interactive build/task mode\n  mini-swe-agent-rs --config-set api_key <key>\n  mini-swe-agent-rs --config-set base_url <url>\n  mini-swe-agent-rs --config-set model <model>\n  mini-swe-agent-rs --config-show\n  mini-swe-agent-rs --config-path\n  mini-swe-agent-rs --sessions                 List saved sessions\n  mini-swe-agent-rs --resume <id-prefix>       Resume saved session in TUI\n  mini-swe-agent-rs --latest                   Resume latest saved session\n  mini-swe-agent-rs --session-path <id-prefix> Print session file path\n\nEnv vars still override config: OPENAI_API_KEY, OPENAI_BASE_URL, MINI_SWE_MODEL\nSessions: ~/.local/share/mini-swe-agent-rs/sessions or MINI_SWE_SESSIONS\n"
     );
 }

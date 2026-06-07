@@ -2,6 +2,10 @@ use crate::{
     agent::{run_agent, run_chat},
     config::Config,
     markdown::render_markdown,
+    session::{
+        latest_session, list_sessions, load_session, resolve_session_id, save_session, short_id,
+        Session, SessionSummary,
+    },
     types::{ChatMessage, Item, Mode, UiMsg},
 };
 use anyhow::Result;
@@ -34,18 +38,33 @@ struct App {
     streaming_body: Option<String>,
     expanded_items: HashSet<usize>,
     model_name: String,
+    session_id: String,
+    session_created_at: u64,
     slash_selected: usize,
     thinking_tick: usize,
+    session_menu: Option<SessionMenu>,
+}
+
+struct SessionMenu {
+    sessions: Vec<SessionSummary>,
+    selected: usize,
 }
 
 pub async fn run() -> Result<()> {
+    run_with_session(None).await
+}
+
+pub async fn run_with_session(resume_id: Option<String>) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = run_inner(&mut terminal).await;
+    let result = run_inner(&mut terminal, resume_id).await;
     restore_terminal(&mut terminal)?;
     result
 }
 
-async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+async fn run_inner(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    resume_id: Option<String>,
+) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiMsg>();
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<String>();
 
@@ -53,27 +72,48 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
         .map(|config| config.model())
         .unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
+    let loaded_session = match resume_id {
+        Some(id) => Some(load_session(&resolve_session_id(&id).unwrap_or(id))?),
+        None => None,
+    };
+    let new_session = Session::new(Mode::Chat, model_name.clone());
+
     let mut app = App {
-        items: vec![Item {
+        items: loaded_session.as_ref().map(Session::items).unwrap_or_else(|| vec![Item {
             title: "mini-swe-agent-rs".into(),
             body: "MODE: CHAT. Press Tab to switch modes. FOR CONVERSATIONS USE CHAT ONLY; FOR TASKS AND BUILDING USE BUILD MODE.".into(),
             color: Color::Yellow,
             is_markdown: false,
             is_truncatable: false,
-        }],
+        }]),
         input: String::new(),
         history: Vec::new(),
         history_pos: -1,
         running: false,
-        mode: Mode::Chat,
-        chat_messages: Vec::new(),
+        mode: loaded_session.as_ref().map(Session::mode).unwrap_or(Mode::Chat),
+        chat_messages: loaded_session
+            .as_ref()
+            .map(|s| s.chat_messages.clone())
+            .unwrap_or_default(),
         scroll: 0,
         auto_scroll: true,
         streaming_body: None,
         expanded_items: HashSet::new(),
-        model_name,
+        model_name: loaded_session
+            .as_ref()
+            .map(|s| s.model.clone())
+            .unwrap_or(model_name),
+        session_id: loaded_session
+            .as_ref()
+            .map(|s| s.id.clone())
+            .unwrap_or(new_session.id),
+        session_created_at: loaded_session
+            .as_ref()
+            .map(|s| s.created_at)
+            .unwrap_or(new_session.created_at),
         slash_selected: 0,
         thinking_tick: 0,
+        session_menu: None,
     };
 
     loop {
@@ -84,13 +124,16 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
                 UiMsg::Log(item) => {
                     app.streaming_body = None;
                     app.items.push(item);
+                    autosave(&app);
                 }
                 UiMsg::ChatDone(messages) => {
                     app.chat_messages = messages;
                     app.running = false;
+                    autosave(&app);
                 }
                 UiMsg::Done => {
                     app.running = false;
+                    autosave(&app);
                 }
             }
             if had_new && app.auto_scroll {
@@ -123,6 +166,39 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
                 if kind == KeyEventKind::Release {
                     continue;
                 }
+                if app.session_menu.is_some() {
+                    match code {
+                        KeyCode::Esc => app.session_menu = None,
+                        KeyCode::Up => {
+                            if let Some(menu) = &mut app.session_menu {
+                                menu.selected = menu.selected.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            if let Some(menu) = &mut app.session_menu {
+                                if !menu.sessions.is_empty() {
+                                    menu.selected =
+                                        (menu.selected + 1).min(menu.sessions.len() - 1);
+                                }
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(menu) = &app.session_menu {
+                                if let Some(summary) = menu.sessions.get(menu.selected) {
+                                    match load_session(&summary.id) {
+                                        Ok(session) => load_session_into_app(&mut app, session),
+                                        Err(e) => push_error(&mut app, "load error", e),
+                                    }
+                                }
+                            }
+                            app.session_menu = None;
+                            autosave(&app);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match (code, modifiers) {
                     (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
                     (KeyCode::Tab, _) if !app.running => {
@@ -137,6 +213,7 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
                         });
                         app.auto_scroll = true;
                         app.scroll = 0;
+                        autosave(&app);
                     }
                     // Slash menu navigation
                     (KeyCode::Up, _) if !app.running && is_slash_menu_open(&app.input) => {
@@ -240,6 +317,61 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
                                     is_truncatable: false,
                                 });
                             }
+                            "/save" => match save_current_session(&app) {
+                                Ok(()) => app.items.push(Item {
+                                    title: "session saved".into(),
+                                    body: app.session_id.clone(),
+                                    color: Color::Green,
+                                    is_markdown: false,
+                                    is_truncatable: false,
+                                }),
+                                Err(e) => app.items.push(Item {
+                                    title: "session save error".into(),
+                                    body: format!("{e:#}"),
+                                    color: Color::Red,
+                                    is_markdown: false,
+                                    is_truncatable: false,
+                                }),
+                            },
+                            "/sessions" | "/resume" => open_session_menu(&mut app),
+                            "/latest" => match latest_session() {
+                                Ok(Some(summary)) => match load_session(&summary.id) {
+                                    Ok(session) => load_session_into_app(&mut app, session),
+                                    Err(e) => push_error(&mut app, "load error", e),
+                                },
+                                Ok(None) => app.items.push(Item {
+                                    title: "sessions".into(),
+                                    body: "No saved sessions.".into(),
+                                    color: Color::Yellow,
+                                    is_markdown: false,
+                                    is_truncatable: false,
+                                }),
+                                Err(e) => push_error(&mut app, "sessions error", e),
+                            },
+                            "/new" => {
+                                let session = Session::new(app.mode, app.model_name.clone());
+                                app.session_id = session.id;
+                                app.session_created_at = session.created_at;
+                                app.items = vec![Item {
+                                    title: "new session".into(),
+                                    body: format!("session {}", short_id(&app.session_id)),
+                                    color: Color::Green,
+                                    is_markdown: false,
+                                    is_truncatable: false,
+                                }];
+                                app.chat_messages.clear();
+                                app.expanded_items.clear();
+                            }
+                            "/load" => open_session_menu(&mut app),
+                            other if other.starts_with("/load ") => {
+                                let id = other.trim_start_matches("/load ").trim();
+                                match resolve_session_id(id)
+                                    .and_then(|full_id| load_session(&full_id))
+                                {
+                                    Ok(session) => load_session_into_app(&mut app, session),
+                                    Err(e) => push_error(&mut app, "load error", e),
+                                }
+                            }
                             "/expand" | "/e" => {
                                 // Expand all truncated items
                                 for i in 0..app.items.len() {
@@ -263,6 +395,7 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
                         }
                         app.auto_scroll = true;
                         app.scroll = 0;
+                        autosave(&app);
                     }
                     // Multi-line: Shift+Enter = newline
                     (KeyCode::Enter, KeyModifiers::SHIFT) if !app.running => {
@@ -413,6 +546,70 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     Ok(())
 }
 
+fn open_session_menu(app: &mut App) {
+    match list_sessions() {
+        Ok(sessions) if sessions.is_empty() => app.items.push(Item {
+            title: "sessions".into(),
+            body: "No saved sessions.".into(),
+            color: Color::Yellow,
+            is_markdown: false,
+            is_truncatable: false,
+        }),
+        Ok(sessions) => {
+            app.session_menu = Some(SessionMenu {
+                sessions,
+                selected: 0,
+            });
+        }
+        Err(e) => push_error(app, "sessions error", e),
+    }
+}
+
+fn save_current_session(app: &App) -> Result<()> {
+    let session = Session::from_app(
+        app.session_id.clone(),
+        app.session_created_at,
+        app.mode,
+        app.model_name.clone(),
+        &app.items,
+        &app.chat_messages,
+    );
+    save_session(&session)
+}
+
+fn autosave(app: &App) {
+    let _ = save_current_session(app);
+}
+
+fn load_session_into_app(app: &mut App, session: Session) {
+    app.session_id = session.id.clone();
+    app.session_created_at = session.created_at;
+    app.mode = session.mode();
+    app.model_name = session.model.clone();
+    app.items = session.items();
+    app.chat_messages = session.chat_messages;
+    app.expanded_items.clear();
+    app.scroll = 0;
+    app.auto_scroll = true;
+    app.items.push(Item {
+        title: "session loaded".into(),
+        body: format!("{}", session.id),
+        color: Color::Green,
+        is_markdown: false,
+        is_truncatable: false,
+    });
+}
+
+fn push_error(app: &mut App, title: &str, error: anyhow::Error) {
+    app.items.push(Item {
+        title: title.into(),
+        body: format!("{error:#}"),
+        color: Color::Red,
+        is_markdown: false,
+        is_truncatable: false,
+    });
+}
+
 const fn mode_color(mode: Mode) -> Color {
     match mode {
         Mode::Chat => Color::Cyan,
@@ -460,6 +657,30 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Show diff guidance",
     },
     SlashCommand {
+        command: "/save",
+        description: "Save current session",
+    },
+    SlashCommand {
+        command: "/sessions",
+        description: "Open saved sessions menu",
+    },
+    SlashCommand {
+        command: "/resume",
+        description: "Open saved sessions menu",
+    },
+    SlashCommand {
+        command: "/load",
+        description: "Load by id prefix: /load abc123",
+    },
+    SlashCommand {
+        command: "/latest",
+        description: "Load latest session",
+    },
+    SlashCommand {
+        command: "/new",
+        description: "Start a new session",
+    },
+    SlashCommand {
         command: "/expand",
         description: "Expand all long outputs",
     },
@@ -487,6 +708,9 @@ fn slash_matches(input: &str) -> Vec<SlashCommand> {
 
 fn resolve_slash_input(input: &str, selected: usize) -> Option<String> {
     let exact = input.trim().to_lowercase();
+    if exact.starts_with("/load ") {
+        return Some(exact);
+    }
     if SLASH_COMMANDS.iter().any(|cmd| cmd.command == exact) {
         return Some(exact);
     }
@@ -565,15 +789,21 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         return;
     }
 
-    // Layout: status (1), gap (1), transcript (remaining - 2), prompt (1)
-    let prompt_area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+    // Layout: status (1), gap (1), transcript, Codex-inspired composer.
+    let composer_height = composer_height(&app.input, area.width);
+    let prompt_area = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(composer_height),
+        area.width,
+        composer_height,
+    );
     let status_area = Rect::new(area.x, area.y, area.width, 1);
     let gap_area = Rect::new(area.x, area.y + 1, area.width, 1);
     let transcript_area = Rect::new(
         area.x,
         area.y + 2,
         area.width,
-        area.height.saturating_sub(3),
+        area.height.saturating_sub(2 + composer_height),
     );
 
     // Status line
@@ -712,30 +942,233 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         }
     }
 
-    // Prompt line
-    let prompt_prefix = if app.running {
-        Span::styled(
-            "...",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled("> ", Style::default().fg(mode_color(app.mode)))
-    };
-    let prompt_line = vec![prompt_prefix, Span::raw(render_input_line(&app.input))];
-    f.render_widget(Paragraph::new(Line::from(prompt_line)), prompt_area);
+    draw_composer(f, prompt_area, app);
 
-    if !app.running && is_slash_menu_open(&app.input) {
+    if !app.running && is_slash_menu_open(&app.input) && app.session_menu.is_none() {
         draw_slash_popup(f, area, prompt_area, app);
+    }
+
+    if app.session_menu.is_some() {
+        draw_session_menu(f, area, app);
     }
 
     // Cursor position
     if !app.running {
-        let cursor_x = 2 + visible_width(&app.input) as u16;
-        let cursor_y = prompt_area.y;
-        f.set_cursor(area.x + cursor_x, cursor_y);
+        let (cursor_x, cursor_y) = composer_cursor(prompt_area, &app.input);
+        f.set_cursor(cursor_x, cursor_y);
     }
+}
+
+fn composer_height(input: &str, width: u16) -> u16 {
+    let inner_width = width.saturating_sub(4).max(1) as usize;
+    let visual_lines = input
+        .split('\n')
+        .map(|line| (visible_width(line).max(1) + inner_width - 1) / inner_width)
+        .sum::<usize>()
+        .max(1);
+    (visual_lines as u16 + 2).clamp(3, 7)
+}
+
+fn draw_composer(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    if area.height < 3 || area.width < 8 {
+        return;
+    }
+
+    let border = if app.running {
+        Color::DarkGray
+    } else {
+        mode_color(app.mode)
+    };
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let top_label = format!(" {} prompt ", app.mode.label());
+    let top_fill = area.width.saturating_sub(top_label.len() as u16 + 2) as usize;
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("╭", Style::default().fg(border)),
+        Span::styled(
+            top_label,
+            Style::default().fg(border).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("─".repeat(top_fill), Style::default().fg(border)),
+        Span::styled("╮", Style::default().fg(border)),
+    ]));
+
+    let mut body_lines = composer_body_lines(
+        &app.input,
+        inner_width,
+        area.height.saturating_sub(2) as usize,
+    );
+    if body_lines.is_empty() {
+        body_lines.push(String::new());
+    }
+    for (idx, body) in body_lines.into_iter().enumerate() {
+        let prefix = if app.running {
+            if idx == 0 {
+                "… "
+            } else {
+                "  "
+            }
+        } else if idx == 0 {
+            "> "
+        } else {
+            "  "
+        };
+        let content_width = area.width.saturating_sub(4) as usize;
+        let shown = truncate_to_width(&body, content_width.saturating_sub(2));
+        let pad = content_width.saturating_sub(2 + visible_width(&shown));
+        lines.push(Line::from(vec![
+            Span::styled("│", Style::default().fg(border)),
+            Span::styled(
+                prefix,
+                Style::default().fg(if app.running { Color::DarkGray } else { border }),
+            ),
+            Span::raw(shown),
+            Span::raw(" ".repeat(pad)),
+            Span::styled("│", Style::default().fg(border)),
+        ]));
+    }
+
+    let hint = if app.running {
+        " running · wait for completion "
+    } else if is_slash_menu_open(&app.input) {
+        " ↑↓ select · Enter run · Esc quit "
+    } else {
+        " Enter send · Shift+Enter newline · / commands · Tab mode "
+    };
+    let hint_fill = area.width.saturating_sub(hint.len() as u16 + 2) as usize;
+    lines.push(Line::from(vec![
+        Span::styled("╰", Style::default().fg(border)),
+        Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        Span::styled("─".repeat(hint_fill), Style::default().fg(border)),
+        Span::styled("╯", Style::default().fg(border)),
+    ]));
+
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn composer_body_lines(input: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let max_content = width.saturating_sub(2).max(1);
+    for logical in input.split('\n') {
+        if logical.is_empty() {
+            out.push(String::new());
+        } else {
+            let mut remaining = logical;
+            while !remaining.is_empty() {
+                let chunk = take_width(remaining, max_content);
+                let len = chunk.len();
+                out.push(chunk.to_string());
+                remaining = &remaining[len..];
+            }
+        }
+        if out.len() >= max_lines {
+            break;
+        }
+    }
+    out.truncate(max_lines);
+    out
+}
+
+fn composer_cursor(area: Rect, input: &str) -> (u16, u16) {
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let max_body_lines = area.height.saturating_sub(2) as usize;
+    let body = composer_body_lines(input, inner_width, max_body_lines);
+    let line_idx = body
+        .len()
+        .saturating_sub(1)
+        .min(max_body_lines.saturating_sub(1));
+    let col = body.last().map(|s| visible_width(s)).unwrap_or(0);
+    (
+        area.x + 3 + col.min(inner_width.saturating_sub(2)) as u16,
+        area.y + 1 + line_idx as u16,
+    )
+}
+
+fn truncate_to_width(s: &str, width: usize) -> String {
+    if visible_width(s) <= width {
+        return s.to_string();
+    }
+    let mut out = take_width(s, width.saturating_sub(1)).to_string();
+    out.push('…');
+    out
+}
+
+fn take_width(s: &str, width: usize) -> &str {
+    if width == 0 {
+        return "";
+    }
+    let mut end = 0;
+    for (idx, ch) in s.char_indices() {
+        if idx >= width {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    &s[..end.min(s.len())]
+}
+
+fn draw_session_menu(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let Some(menu) = &app.session_menu else {
+        return;
+    };
+    let width = area.width.saturating_sub(4).min(88).max(36);
+    let height = (menu.sessions.len().min(12) as u16 + 3).min(area.height.saturating_sub(2));
+    if height < 4 {
+        return;
+    }
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup_area = Rect::new(x, y, width, height);
+    f.render_widget(Clear, popup_area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            " sessions ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  Enter:load  Up/Down:select  Esc:close",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    for (idx, session) in menu.sessions.iter().take((height - 3) as usize).enumerate() {
+        let selected = idx == menu.selected.min(menu.sessions.len().saturating_sub(1));
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let dim = if selected {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<8}", short_id(&session.id)),
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {:<5}", session.mode), style),
+            Span::styled(
+                format!(
+                    " {:<18}",
+                    session.model.chars().take(18).collect::<String>()
+                ),
+                dim,
+            ),
+            Span::styled(format!(" {} items", session.item_count), dim),
+        ]));
+    }
+
+    f.render_widget(Paragraph::new(lines), popup_area);
 }
 
 fn draw_slash_popup(f: &mut ratatui::Frame, area: Rect, prompt_area: Rect, app: &mut App) {
@@ -783,21 +1216,6 @@ fn draw_slash_popup(f: &mut ratatui::Frame, area: Rect, prompt_area: Rect, app: 
     }
 
     f.render_widget(Paragraph::new(lines), popup_area);
-}
-
-fn render_input_line(input: &str) -> String {
-    // Replace newlines with visible indicator in prompt display
-    if input.contains('\n') {
-        let first_line = input.lines().next().unwrap_or("");
-        let extra_lines = input.lines().count() - 1;
-        if extra_lines > 0 {
-            format!("{} ↵{}", first_line, extra_lines)
-        } else {
-            first_line.to_string()
-        }
-    } else {
-        input.to_string()
-    }
 }
 
 fn visible_width(s: &str) -> usize {
